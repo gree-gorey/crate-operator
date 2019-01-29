@@ -125,6 +125,25 @@ func (r *ReconcileCrate) Reconcile(request reconcile.Request) (reconcile.Result,
 		return reconcile.Result{}, err
 	}
 
+	// Check if the Service already exists, if not create a new one
+	foundSvc := &corev1.Service{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: crate.Name, Namespace: crate.Namespace}, foundSvc)
+	if err != nil && errors.IsNotFound(err) {
+		// Define a new Service
+		svc := r.serviceForCrate(crate)
+		reqLogger.Info("Creating a new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+		err = r.client.Create(context.TODO(), svc)
+		if err != nil {
+			reqLogger.Error(err, "Failed to create new Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+			return reconcile.Result{}, err
+		}
+		// StatefulSet created successfully - return and requeue
+		return reconcile.Result{Requeue: true}, nil
+	} else if err != nil {
+		reqLogger.Error(err, "Failed to get Service")
+		return reconcile.Result{}, err
+	}
+
 	// Ensure the StatefulSet size is the same as the spec
 	size := crate.Spec.Size
 	if *found.Spec.Replicas != size {
@@ -166,6 +185,12 @@ func (r *ReconcileCrate) Reconcile(request reconcile.Request) (reconcile.Result,
 // statefulSetForCrate returns a crate StatefulSet object
 func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.StatefulSet {
 	ls := labelsForCrate(c.Name)
+	as := map[string]string{
+		"crate.io/cluster-name": c.Spec.ClusterName,
+		"crate.io/size": fmt.Sprintf("%d", c.Spec.Size),
+		"crate.io/enterprise": fmt.Sprintf("%t", c.Spec.Enterprise),
+		"pod.alpha.kubernetes.io/initialized": "true",
+	}
 	replicas := c.Spec.Size
 
 	st := &appsv1.StatefulSet{
@@ -176,10 +201,7 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      c.Name,
 			Namespace: c.Namespace,
-			Annotations: map[string]string{
-				"crate.io/cluster-name": c.Spec.ClusterName,
-				"crate.io/size": string(c.Spec.Size),
-			},
+			Annotations: as,
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -189,6 +211,7 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: ls,
+					Annotations: as,
 				},
 				Spec: corev1.PodSpec{
 					InitContainers: []corev1.Container{{
@@ -202,6 +225,32 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 					Containers: []corev1.Container{{
 						Image:   c.Spec.Image,
 						Name:    "crate",
+						Env: []corev1.EnvVar{
+							{
+								Name: "CLUSTER_NAME",
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										FieldPath: "metadata.annotations['crate.io/cluster-name']",
+									},
+								},
+							},
+							{
+								Name: "EXPECTED_NODES",
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										FieldPath: "metadata.annotations['crate.io/size']",
+									},
+								},
+							},
+							{
+								Name: "ENTERPRISE",
+								ValueFrom: &corev1.EnvVarSource{
+									FieldRef: &corev1.ObjectFieldSelector{
+										FieldPath: "metadata.annotations['crate.io/enterprise']",
+									},
+								},
+							},
+						},
 						Ports: []corev1.ContainerPort{
 							{
 								ContainerPort: 4200,
@@ -218,13 +267,13 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 						},
 						Command: []string{
 							"/docker-entrypoint.sh",
-							fmt.Sprintf("-Ccluster.name=%s", c.Spec.ClusterName),
+							"-Ccluster.name=$CLUSTER_NAME",
 						  "-Cdiscovery.zen.hosts_provider=srv",
 						  "-Cdiscovery.zen.minimum_master_nodes=2",
 							fmt.Sprintf("-Cdiscovery.srv.query=_cluster._tcp.%s.%s.svc.cluster.local", c.Name, c.Namespace),
 						  "-Cgateway.recover_after_nodes=2",
-							fmt.Sprintf("-Cgateway.expected_nodes=%d", c.Spec.Size),
-							fmt.Sprintf("-Clicense.enterprise=%t", c.Spec.Enterprise),
+							"-Cgateway.expected_nodes=$EXPECTED_NODES",
+							"-Clicense.enterprise=$ENTERPRISE",
 						  "-Cnetwork.host=_site_",
 						},
 					}},
@@ -235,6 +284,44 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 	// Set Crate instance as the owner and controller
 	controllerutil.SetControllerReference(c, st, r.scheme)
 	return st
+}
+
+// serviceForCrate returns a crate Service object
+func (r *ReconcileCrate) serviceForCrate(c *cratev1alpha1.Crate) *corev1.Service {
+	ls := labelsForCrate(c.Name)
+
+	svc := &corev1.Service{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Service",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.Name,
+			Namespace: c.Namespace,
+		},
+		Spec: corev1.ServiceSpec {
+			Selector: ls,
+			ClusterIP: "None",
+			Ports: []corev1.ServicePort{
+				{
+					Port: 4200,
+					Name: "crate-web",
+				},
+				{
+					Port: 4300,
+					Name: "cluster",
+				},
+				{
+					Port: 5432,
+					Name: "postgres",
+				},
+			},
+		},
+	}
+
+	// Set Crate instance as the owner and controller
+	controllerutil.SetControllerReference(c, svc, r.scheme)
+	return svc
 }
 
 // labelsForCrate returns the labels for selecting the resources
