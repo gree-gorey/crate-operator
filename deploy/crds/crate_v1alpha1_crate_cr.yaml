@@ -1,0 +1,7 @@
+apiVersion: crate.io/v1alpha1
+kind: Crate
+metadata:
+  name: example-crate
+spec:
+  # Add fields here
+  size: 3
