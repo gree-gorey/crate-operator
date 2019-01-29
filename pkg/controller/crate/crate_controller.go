@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"context"
 	"reflect"
+	"encoding/json"
 
 	cratev1alpha1 "github.com/gree-gorey/crate-operator/pkg/apis/crate/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -185,10 +186,12 @@ func (r *ReconcileCrate) Reconcile(request reconcile.Request) (reconcile.Result,
 // statefulSetForCrate returns a crate StatefulSet object
 func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.StatefulSet {
 	ls := labelsForCrate(c.Name)
+	opts, _ := json.Marshal(c.Spec.ExtraOptions)
 	as := map[string]string{
 		"crate.io/cluster-name": c.Spec.ClusterName,
 		"crate.io/size": fmt.Sprintf("%d", c.Spec.Size),
-		"crate.io/enterprise": fmt.Sprintf("%t", c.Spec.Enterprise),
+		// "crate.io/extra-options": opts,
+		"crate.io/extra-options": fmt.Sprintf("%s", opts),
 		"pod.alpha.kubernetes.io/initialized": "true",
 	}
 	replicas := c.Spec.Size
@@ -265,17 +268,16 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 								Name:          "postgres",
 							},
 						},
-						Command: []string{
+						Command: append( []string{
 							"/docker-entrypoint.sh",
 							"-Ccluster.name=$CLUSTER_NAME",
 						  "-Cdiscovery.zen.hosts_provider=srv",
-						  "-Cdiscovery.zen.minimum_master_nodes=2",
+						  "-Cdiscovery.zen.minimum_master_nodes=$(( EXPECTED_NODES / 2 + 1 ))",
 							fmt.Sprintf("-Cdiscovery.srv.query=_cluster._tcp.%s.%s.svc.cluster.local", c.Name, c.Namespace),
-						  "-Cgateway.recover_after_nodes=2",
+						  "-Cgateway.recover_after_nodes=$(( EXPECTED_NODES / 2 + 1 ))",
 							"-Cgateway.expected_nodes=$EXPECTED_NODES",
-							"-Clicense.enterprise=$ENTERPRISE",
 						  "-Cnetwork.host=_site_",
-						},
+						}, c.Spec.ExtraOptions... ),
 					}},
 				},
 			},

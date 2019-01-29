@@ -14,7 +14,7 @@ type CrateSpec struct {
 	Size int32 `json:"size"`
 	Image string `json:"image"`
 	ClusterName string `json:"clusterName"`
-	Enterprise bool `json:"enterprise"`
+	ExtraOptions []string `json:"extraOptions"`
 }
 
 // CrateStatus defines the observed state of Crate

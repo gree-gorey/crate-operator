@@ -6,4 +6,5 @@ spec:
   size: 3
   image: crate:3.0
   clusterName: dev
-  enterprise: false
+  extraOptions:
+  - "-Clicense.enterprise=false"
