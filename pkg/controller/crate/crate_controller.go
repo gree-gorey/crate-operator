@@ -1,6 +1,7 @@
 package crate
 
 import (
+	"fmt"
 	"context"
 	"reflect"
 
@@ -163,9 +164,9 @@ func (r *ReconcileCrate) Reconcile(request reconcile.Request) (reconcile.Result,
 }
 
 // statefulSetForCrate returns a crate StatefulSet object
-func (r *ReconcileCrate) statefulSetForCrate(m *cratev1alpha1.Crate) *appsv1.StatefulSet {
-	ls := labelsForCrate(m.Name)
-	replicas := m.Spec.Size
+func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.StatefulSet {
+	ls := labelsForCrate(c.Name)
+	replicas := c.Spec.Size
 
 	st := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
@@ -173,8 +174,12 @@ func (r *ReconcileCrate) statefulSetForCrate(m *cratev1alpha1.Crate) *appsv1.Sta
 			Kind:       "StatefulSet",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
+			Name:      c.Name,
+			Namespace: c.Namespace,
+			Annotations: map[string]string{
+				"crate.io/cluster-name": c.Spec.ClusterName,
+				"crate.io/size": string(c.Spec.Size),
+			},
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
@@ -186,20 +191,49 @@ func (r *ReconcileCrate) statefulSetForCrate(m *cratev1alpha1.Crate) *appsv1.Sta
 					Labels: ls,
 				},
 				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Image:   "busybox",
+						Name:    "init-sysctl",
+						Command: []string{"sysctl", "-w", "vm.max_map_count=262144"},
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: func() *bool { b := true; return &b }(),
+						},
+					}},
 					Containers: []corev1.Container{{
-						Image:   "nginx",
+						Image:   c.Spec.Image,
 						Name:    "crate",
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 80,
-							Name:          "http",
-						}},
+						Ports: []corev1.ContainerPort{
+							{
+								ContainerPort: 4200,
+								Name:          "crate-web",
+							},
+							{
+								ContainerPort: 4300,
+								Name:          "cluster",
+							},
+							{
+								ContainerPort: 5432,
+								Name:          "postgres",
+							},
+						},
+						Command: []string{
+							"/docker-entrypoint.sh",
+							fmt.Sprintf("-Ccluster.name=%s", c.Spec.ClusterName),
+						  "-Cdiscovery.zen.hosts_provider=srv",
+						  "-Cdiscovery.zen.minimum_master_nodes=2",
+							fmt.Sprintf("-Cdiscovery.srv.query=_cluster._tcp.%s.%s.svc.cluster.local", c.Name, c.Namespace),
+						  "-Cgateway.recover_after_nodes=2",
+							fmt.Sprintf("-Cgateway.expected_nodes=%d", c.Spec.Size),
+							fmt.Sprintf("-Clicense.enterprise=%t", c.Spec.Enterprise),
+						  "-Cnetwork.host=_site_",
+						},
 					}},
 				},
 			},
 		},
 	}
 	// Set Crate instance as the owner and controller
-	controllerutil.SetControllerReference(m, st, r.scheme)
+	controllerutil.SetControllerReference(c, st, r.scheme)
 	return st
 }
 
