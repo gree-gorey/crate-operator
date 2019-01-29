@@ -16,7 +16,7 @@ spec:
       containers:
         - name: crate-operator
           # Replace this with the built image name
-          image: REPLACE_IMAGE
+          image: greegorey/crate-operator:0.0.1
           command:
           - crate-operator
           imagePullPolicy: Always

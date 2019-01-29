@@ -2,11 +2,14 @@ package crate
 
 import (
 	"context"
+	"reflect"
 
 	cratev1alpha1 "github.com/gree-gorey/crate-operator/pkg/apis/crate/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,7 +56,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 
 	// TODO(user): Modify this to be the types you create that are owned by the primary resource
 	// Watch for changes to secondary resource Pods and requeue the owner Crate
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
+	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &cratev1alpha1.Crate{},
 	})
@@ -68,6 +71,7 @@ var _ reconcile.Reconciler = &ReconcileCrate{}
 
 // ReconcileCrate reconciles a Crate object
 type ReconcileCrate struct {
+	// TODO: Clarify the split client
 	// This client, initialized using mgr.Client() above, is a split client
 	// that reads objects from the cache and writes to the apiserver
 	client client.Client
@@ -77,7 +81,7 @@ type ReconcileCrate struct {
 // Reconcile reads that state of the cluster for a Crate object and makes changes based on the state read
 // and what is in the Crate.Spec
 // TODO(user): Modify this Reconcile function to implement your Controller logic.  This example creates
-// a Pod as an example
+// a Crate Deployment for each Crate CR
 // Note:
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
@@ -86,67 +90,130 @@ func (r *ReconcileCrate) Reconcile(request reconcile.Request) (reconcile.Result,
 	reqLogger.Info("Reconciling Crate")
 
 	// Fetch the Crate instance
-	instance := &cratev1alpha1.Crate{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
+	crate := &cratev1alpha1.Crate{}
+	err := r.client.Get(context.TODO(), request.NamespacedName, crate)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
+			reqLogger.Info("Crate resource not found. Ignoring since object must be deleted")
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
+		reqLogger.Error(err, "Failed to get Crate")
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
-
-	// Set Crate instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
-		return reconcile.Result{}, err
-	}
-
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
+	// Check if the deployment already exists, if not create a new one
+	found := &appsv1.Deployment{}
+	err = r.client.Get(context.TODO(), types.NamespacedName{Name: crate.Name, Namespace: crate.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
+		// Define a new deployment
+		dep := r.deploymentForCrate(crate)
+		reqLogger.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		err = r.client.Create(context.TODO(), dep)
 		if err != nil {
+			reqLogger.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 			return reconcile.Result{}, err
 		}
-
-		// Pod created successfully - don't requeue
-		return reconcile.Result{}, nil
+		// Deployment created successfully - return and requeue
+		return reconcile.Result{Requeue: true}, nil
 	} else if err != nil {
+		reqLogger.Error(err, "Failed to get Deployment")
 		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	// Ensure the deployment size is the same as the spec
+	size := crate.Spec.Size
+	if *found.Spec.Replicas != size {
+		found.Spec.Replicas = &size
+		err = r.client.Update(context.TODO(), found)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+			return reconcile.Result{}, err
+		}
+		// Spec updated - return and requeue
+		return reconcile.Result{Requeue: true}, nil
+	}
+
+	// Update the Crate status with the pod names
+	// List the pods for this crate's deployment
+	podList := &corev1.PodList{}
+	labelSelector := labels.SelectorFromSet(labelsForCrate(crate.Name))
+	listOps := &client.ListOptions{Namespace: crate.Namespace, LabelSelector: labelSelector}
+	err = r.client.List(context.TODO(), listOps, podList)
+	if err != nil {
+		reqLogger.Error(err, "Failed to list pods", "Crate.Namespace", crate.Namespace, "Crate.Name", crate.Name)
+		return reconcile.Result{}, err
+	}
+	podNames := getPodNames(podList.Items)
+
+	// Update status.Nodes if needed
+	if !reflect.DeepEqual(podNames, crate.Status.Nodes) {
+		crate.Status.Nodes = podNames
+		err := r.client.Status().Update(context.TODO(), crate)
+		if err != nil {
+			reqLogger.Error(err, "Failed to update Crate status")
+			return reconcile.Result{}, err
+		}
+	}
+
 	return reconcile.Result{}, nil
 }
 
-// newPodForCR returns a busybox pod with the same name/namespace as the cr
-func newPodForCR(cr *cratev1alpha1.Crate) *corev1.Pod {
-	labels := map[string]string{
-		"app": cr.Name,
-	}
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name + "-pod",
-			Namespace: cr.Namespace,
-			Labels:    labels,
+// deploymentForCrate returns a crate Deployment object
+func (r *ReconcileCrate) deploymentForCrate(m *cratev1alpha1.Crate) *appsv1.Deployment {
+	ls := labelsForCrate(m.Name)
+	replicas := m.Spec.Size
+
+	dep := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    "busybox",
-					Image:   "busybox",
-					Command: []string{"sleep", "3600"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      m.Name,
+			Namespace: m.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: ls,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: ls,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Image:   "nginx",
+						Name:    "crate",
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: 80,
+							Name:          "http",
+						}},
+					}},
 				},
 			},
 		},
 	}
+	// Set Crate instance as the owner and controller
+	controllerutil.SetControllerReference(m, dep, r.scheme)
+	return dep
+}
+
+// labelsForCrate returns the labels for selecting the resources
+// belonging to the given crate CR name.
+func labelsForCrate(name string) map[string]string {
+	return map[string]string{"app": "crate", "crate_cr": name}
+}
+
+// getPodNames returns the pod names of the array of pods passed in
+func getPodNames(pods []corev1.Pod) []string {
+	var podNames []string
+	for _, pod := range pods {
+		podNames = append(podNames, pod.Name)
+	}
+	return podNames
 }
