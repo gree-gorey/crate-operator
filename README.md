@@ -1,0 +1,1 @@
+# Kubernetes operator for CrateDB
