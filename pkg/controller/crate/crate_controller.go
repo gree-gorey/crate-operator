@@ -190,7 +190,6 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 	as := map[string]string{
 		"crate.io/cluster-name": c.Spec.ClusterName,
 		"crate.io/size": fmt.Sprintf("%d", c.Spec.Size),
-		// "crate.io/extra-options": opts,
 		"crate.io/extra-options": fmt.Sprintf("%s", opts),
 		"pod.alpha.kubernetes.io/initialized": "true",
 	}
@@ -242,14 +241,6 @@ func (r *ReconcileCrate) statefulSetForCrate(c *cratev1alpha1.Crate) *appsv1.Sta
 								ValueFrom: &corev1.EnvVarSource{
 									FieldRef: &corev1.ObjectFieldSelector{
 										FieldPath: "metadata.annotations['crate.io/size']",
-									},
-								},
-							},
-							{
-								Name: "ENTERPRISE",
-								ValueFrom: &corev1.EnvVarSource{
-									FieldRef: &corev1.ObjectFieldSelector{
-										FieldPath: "metadata.annotations['crate.io/enterprise']",
 									},
 								},
 							},
